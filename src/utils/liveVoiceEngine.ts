@@ -26,41 +26,51 @@ export class LiveVoiceEngine {
     this.options = options;
   }
 
-  public async connect(): Promise<void> {
+  public async connect(retries = 3): Promise<void> {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
     const wsUrl = `${protocol}//${host}/ws/live?level=${encodeURIComponent(this.options.level)}`;
 
-    return new Promise((resolve, reject) => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
       try {
-        this.ws = new WebSocket(wsUrl);
+        await new Promise<void>((resolve, reject) => {
+          this.ws = new WebSocket(wsUrl);
 
-        this.ws.onopen = () => {
-          console.log('Connected to Gemini Live WebSocket');
-          if (this.options.onConnected) {
-            this.options.onConnected();
-          }
-          resolve();
-        };
+          this.ws.onopen = () => {
+            console.log(`Connected to Gemini Live WebSocket (Attempt ${attempt})`);
+            if (this.options.onConnected) {
+              this.options.onConnected();
+            }
+            resolve();
+          };
 
-        this.ws.onmessage = (event) => {
-          this.handleServerMessage(event.data);
-        };
+          this.ws.onmessage = (event) => {
+            this.handleServerMessage(event.data);
+          };
 
-        this.ws.onerror = (err) => {
-          console.error('WebSocket error:', err);
-          this.options.onError('Error de conexión con el tutor de voz IA.');
-          reject(err);
-        };
+          this.ws.onerror = (err) => {
+            console.warn(`WebSocket error on attempt ${attempt}:`, err);
+            reject(err);
+          };
 
-        this.ws.onclose = () => {
-          console.log('WebSocket connection closed.');
-        };
+          this.ws.onclose = () => {
+            console.log('WebSocket connection closed.');
+          };
+        });
+
+        // Connection successful, break retry loop
+        return;
       } catch (e: any) {
-        this.options.onError(e.message || 'Error al iniciar conexión de voz.');
-        reject(e);
+        if (attempt < retries) {
+          console.log(`Retrying Gemini Live WebSocket connection (${attempt}/${retries})...`);
+          await new Promise((res) => setTimeout(res, 1000));
+        } else {
+          console.error('All Gemini Live WebSocket connection attempts failed.');
+          this.options.onError('No se pudo establecer la conexión de voz Gemini Live. Revisa tu red o intenta de nuevo.');
+          throw e;
+        }
       }
-    });
+    }
   }
 
   public async startMicrophone(): Promise<void> {

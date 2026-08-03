@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { EnglishLevel, ChatMessage } from '../types';
-import { SpeechEngine } from '../utils/speechEngine';
+import { LiveVoiceEngine } from '../utils/liveVoiceEngine';
 import {
   Mic,
   MicOff,
@@ -33,137 +33,83 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   const [currentUserDraft, setCurrentUserDraft] = useState<string>('');
   const [textInput, setTextInput] = useState<string>('');
   const [showTextInput, setShowTextInput] = useState<boolean>(false);
-  const [isLoadingReply, setIsLoadingReply] = useState<boolean>(false);
+  const [isConnected, setIsConnected] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [silenceCounter, setSilenceCounter] = useState<number>(0);
 
-  const speechEngineRef = useRef<SpeechEngine | null>(null);
+  const liveEngineRef = useRef<LiveVoiceEngine | null>(null);
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
   const isMountedRef = useRef<boolean>(true);
 
-  // Speed rate based on level
-  const speedRate = React.useMemo(() => {
+  // Speed rate label for display based on level
+  const speedLabel = React.useMemo(() => {
     switch (level) {
       case 'A1':
       case 'A2':
-        return 0.82;
+        return '82%';
       case 'B1':
-        return 0.9;
+        return '90%';
       case 'B2':
-        return 0.98;
+        return '98%';
       case 'C1':
       case 'C2':
       default:
-        return 1.0;
+        return '100%';
     }
   }, [level]);
 
-  // Scroll to bottom on new message
+  // Scroll to bottom on transcript update
   useEffect(() => {
     if (chatContainerRef.current) {
       chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
     }
   }, [messages, currentAssistantText, currentUserDraft]);
 
-  // Handle incoming AI response
-  const fetchAndPlayReply = async (
-    chatHistory: ChatMessage[],
-    userAction?: 'repeat' | 'slow_down' | 'help_spanish' | 'user_message'
-  ) => {
-    setIsLoadingReply(true);
-    setErrorMessage(null);
-
-    try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: chatHistory.map((m) => ({ role: m.role, text: m.text })),
-          level,
-          action: userAction,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('No se pudo obtener la respuesta del tutor.');
-      }
-
-      const data = await response.json();
-      const replyText = data.reply || "Hello! It's great to meet you today. Tell me a bit about yourself!";
-
-      if (!isMountedRef.current) return;
-
-      const assistantMsg: ChatMessage = {
-        id: 'msg-' + Date.now(),
-        role: 'assistant',
-        text: replyText,
-        timestamp: Date.now(),
-      };
-
-      setMessages((prev) => [...prev, assistantMsg]);
-      setCurrentAssistantText(replyText);
-
-      // Speak text aloud
-      if (speechEngineRef.current) {
-        speechEngineRef.current.speak(replyText, speedRate);
-      }
-    } catch (err: any) {
-      console.error('Error fetching chat reply:', err);
-      if (isMountedRef.current) {
-        setErrorMessage(err.message || 'Error de conexión con el tutor de IA.');
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setIsLoadingReply(false);
-      }
-    }
-  };
-
-  // User message submit handler
-  const handleUserSendMessage = (textToSend: string) => {
-    if (!textToSend.trim()) return;
-
-    // Interrupt speech synthesis if running
-    if (speechEngineRef.current) {
-      speechEngineRef.current.stopSpeaking();
-    }
-    setIsAssistantSpeaking(false);
-
-    // Reset silence tracker
-    setSilenceCounter(0);
-
-    const userMsg: ChatMessage = {
-      id: 'user-' + Date.now(),
-      role: 'user',
-      text: textToSend.trim(),
-      timestamp: Date.now(),
-    };
-
-    const newHistory = [...messages, userMsg];
-    setMessages(newHistory);
-    setCurrentUserDraft('');
-    setTextInput('');
-
-    // Fetch tutor response
-    fetchAndPlayReply(newHistory, 'user_message');
-  };
-
-  // Initialize speech engine on mount
+  // Initialize Gemini Live Voice Engine on mount
   useEffect(() => {
     isMountedRef.current = true;
 
-    const engine = new SpeechEngine({
-      onUserSpeechResult: (text, isFinal) => {
+    const engine = new LiveVoiceEngine({
+      level,
+      onConnected: () => {
+        if (isMountedRef.current) {
+          setIsConnected(true);
+        }
+      },
+      onUserTranscript: (text, isFinal) => {
         if (!isMountedRef.current) return;
+        setSilenceCounter(0);
         if (isFinal) {
-          handleUserSendMessage(text);
+          if (text.trim()) {
+            const userMsg: ChatMessage = {
+              id: 'user-' + Date.now(),
+              role: 'user',
+              text: text.trim(),
+              timestamp: Date.now(),
+            };
+            setMessages((prev) => [...prev, userMsg]);
+          }
+          setCurrentUserDraft('');
         } else {
           setCurrentUserDraft(text);
         }
       },
-      onUserSpeechStart: () => {
+      onAssistantTranscript: (text, isFinal) => {
         if (!isMountedRef.current) return;
-        setSilenceCounter(0);
+        if (isFinal) {
+          if (text.trim()) {
+            const assistantMsg: ChatMessage = {
+              id: 'msg-' + Date.now(),
+              role: 'assistant',
+              text: text.trim(),
+              timestamp: Date.now(),
+            };
+            setMessages((prev) => [...prev, assistantMsg]);
+          }
+          setCurrentAssistantText('');
+        } else {
+          setCurrentAssistantText(text);
+        }
       },
       onAssistantStartSpeaking: () => {
         if (isMountedRef.current) {
@@ -176,24 +122,31 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
         }
       },
       onError: (err) => {
-        console.warn('Speech engine info:', err);
+        if (isMountedRef.current) {
+          setErrorMessage(err);
+        }
       },
     });
 
-    engine.setSpeechRate(speedRate);
-    speechEngineRef.current = engine;
+    liveEngineRef.current = engine;
 
-    // Start microphone listening automatically
-    engine.startListening();
-    setIsListening(true);
-
-    // Initial greeting from tutor
-    fetchAndPlayReply([]);
+    // Connect to Gemini Live WebSocket and activate mic
+    engine
+      .connect()
+      .then(() => {
+        if (isMountedRef.current) {
+          engine.startMicrophone();
+          setIsListening(true);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to establish Gemini Live voice connection:', err);
+      });
 
     return () => {
       isMountedRef.current = false;
-      if (speechEngineRef.current) {
-        speechEngineRef.current.destroy();
+      if (liveEngineRef.current) {
+        liveEngineRef.current.destroy();
       }
     };
   }, [level]);
@@ -201,50 +154,72 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   // Silence timer monitor
   useEffect(() => {
     const interval = setInterval(() => {
-      if (!isAssistantSpeaking && !isLoadingReply && isListening) {
+      if (!isAssistantSpeaking && isListening && isConnected) {
         setSilenceCounter((prev) => prev + 1);
       }
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [isAssistantSpeaking, isLoadingReply, isListening]);
+  }, [isAssistantSpeaking, isListening, isConnected]);
 
   // Interrupt Assistant
   const handleInterrupt = () => {
-    if (speechEngineRef.current) {
-      speechEngineRef.current.stopSpeaking();
+    if (liveEngineRef.current) {
+      liveEngineRef.current.stopSpeaking();
+      liveEngineRef.current.sendInterruptSignal();
     }
     setIsAssistantSpeaking(false);
+  };
+
+  // User manual text message sent over Gemini Live WS
+  const handleUserSendMessage = (textToSend: string) => {
+    if (!textToSend.trim() || !liveEngineRef.current) return;
+    setSilenceCounter(0);
+
+    const userMsg: ChatMessage = {
+      id: 'user-' + Date.now(),
+      role: 'user',
+      text: textToSend.trim(),
+      timestamp: Date.now(),
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+    liveEngineRef.current.sendTextMessage(textToSend.trim());
+    setTextInput('');
   };
 
   // Quick Action: Repeat
   const handleRepeat = () => {
     handleInterrupt();
-    fetchAndPlayReply(messages, 'repeat');
+    if (liveEngineRef.current) {
+      liveEngineRef.current.sendTextMessage('Could you please repeat what you just said?');
+    }
   };
 
   // Quick Action: Speak Slower
   const handleSlower = () => {
     handleInterrupt();
-    fetchAndPlayReply(messages, 'slow_down');
+    if (liveEngineRef.current) {
+      liveEngineRef.current.sendTextMessage('Could you please speak a bit slower and simpler?');
+    }
   };
 
   // Quick Action: Spanish Help (for A1, A2, B1)
   const handleSpanishHelp = () => {
     handleInterrupt();
-    fetchAndPlayReply(messages, 'help_spanish');
+    if (liveEngineRef.current) {
+      liveEngineRef.current.sendTextMessage(
+        'Could you please explain or translate that in Spanish for me?'
+      );
+    }
   };
 
   // Toggle Microphone
   const toggleListening = () => {
-    if (!speechEngineRef.current) return;
-    if (isListening) {
-      speechEngineRef.current.stopListening();
-      setIsListening(false);
-    } else {
-      speechEngineRef.current.startListening();
-      setIsListening(true);
-    }
+    if (!liveEngineRef.current) return;
+    const newListening = !isListening;
+    setIsListening(newListening);
+    liveEngineRef.current.toggleMicrophone(newListening);
   };
 
   return (
@@ -257,7 +232,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
           </div>
           <div>
             <span className="text-xs font-bold text-gray-400 uppercase tracking-wider block">
-              Práctica de Habla
+              Práctica de Voz Gemini Live Real-Time
             </span>
             <span className="text-sm font-bold text-gray-800">
               Nivel seleccionado: {level}
@@ -267,13 +242,13 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
 
         <div className="flex items-center gap-2">
           <span className="hidden sm:inline text-xs text-gray-500 font-semibold">
-            Velocidad: {Math.round(speedRate * 100)}%
+            Ritmo: {speedLabel}
           </span>
           <button
             onClick={() => {
               handleInterrupt();
-              if (speechEngineRef.current) {
-                speechEngineRef.current.destroy();
+              if (liveEngineRef.current) {
+                liveEngineRef.current.destroy();
               }
               onEndSession(messages);
             }}
@@ -318,14 +293,14 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
             )}
           </div>
 
-          <h2 className="text-xl sm:text-2xl font-extrabold text-gray-800">Tutor de Inglés IA</h2>
+          <h2 className="text-xl sm:text-2xl font-extrabold text-gray-800">Tutor de Inglés Gemini Live</h2>
           <p className="text-xs sm:text-sm text-[#FF6B6B] font-bold mt-0.5">
             {isAssistantSpeaking
-              ? 'El tutor está hablando...'
-              : isLoadingReply
-              ? 'Generando respuesta...'
+              ? 'Hablando voz nativa IA...'
               : isListening
               ? 'Escuchando tu voz...'
+              : !isConnected
+              ? 'Conectando sesión de voz Gemini Live...'
               : 'Pausado'}
           </p>
 
@@ -333,7 +308,8 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
           <div className="flex items-center gap-4 mt-6">
             <button
               onClick={toggleListening}
-              className={`p-4 rounded-2xl font-bold transition-all flex items-center gap-2 text-sm cursor-pointer shadow-sm ${
+              disabled={!isConnected}
+              className={`p-4 rounded-2xl font-bold transition-all flex items-center gap-2 text-sm cursor-pointer shadow-sm disabled:opacity-50 ${
                 isListening
                   ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'
                   : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
@@ -367,18 +343,44 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
 
       {/* Error alert if any */}
       {errorMessage && (
-        <div className="p-4 bg-red-50 border-2 border-red-200 rounded-2xl text-xs text-red-700 flex items-center gap-3">
-          <AlertCircle className="w-5 h-5 shrink-0" />
-          <span>{errorMessage}</span>
+        <div className="p-4 bg-red-50 border-2 border-red-200 rounded-2xl text-xs text-red-700 flex items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-5 h-5 shrink-0 text-red-600" />
+            <span>{errorMessage}</span>
+          </div>
+          <button
+            onClick={() => {
+              setErrorMessage(null);
+              setIsConnected(false);
+              if (liveEngineRef.current) {
+                liveEngineRef.current
+                  .connect()
+                  .then(() => {
+                    setIsConnected(true);
+                    if (liveEngineRef.current) {
+                      liveEngineRef.current.startMicrophone();
+                      setIsListening(true);
+                    }
+                  })
+                  .catch(() => {
+                    // Handled inside liveEngineRef onError
+                  });
+              }
+            }}
+            className="px-3 py-1.5 bg-red-100 hover:bg-red-200 text-red-800 font-bold rounded-xl transition-colors shrink-0 cursor-pointer flex items-center gap-1"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Reconectar</span>
+          </button>
         </div>
       )}
 
       {/* Patience prompt */}
-      {silenceCounter > 8 && !isAssistantSpeaking && !isLoadingReply && (
+      {silenceCounter > 8 && !isAssistantSpeaking && isListening && (
         <div className="p-4 bg-amber-50 border-3 border-[#FFD93D] rounded-2xl text-xs text-amber-900 flex items-center justify-between gap-3 shadow-xs">
           <div className="flex items-center gap-2">
             <HelpCircle className="w-4 h-4 text-amber-600 shrink-0" />
-            <span className="font-medium">El tutor espera con paciencia. ¿Quieres que repita o te ayude?</span>
+            <span className="font-medium">El tutor espera con paciencia. Habla con confianza o pide ayuda.</span>
           </div>
           {['A1', 'A2', 'B1'].includes(level) && (
             <button
@@ -391,21 +393,21 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
         </div>
       )}
 
-      {/* Transcript Container with Vibrant Teal border */}
+      {/* Transcript Container */}
       <div className="bg-white border-4 border-[#6BCBCA] rounded-[32px] p-6 shadow-lg space-y-4 relative">
         <div className="text-[10px] font-black uppercase tracking-[0.2em] text-[#6BCBCA] flex items-center justify-between border-b border-gray-100 pb-2">
-          <span>Transcripción de Conversación</span>
-          <span className="text-gray-400 font-normal tracking-normal lowercase">en vivo</span>
+          <span>Transcripción Gemini Live</span>
+          <span className="text-gray-400 font-normal tracking-normal lowercase">en tiempo real</span>
         </div>
 
         <div
           ref={chatContainerRef}
           className="max-h-80 min-h-48 overflow-y-auto space-y-4 pr-2"
         >
-          {messages.length === 0 && isLoadingReply && (
+          {!isConnected && (
             <div className="text-center py-10 text-gray-400 text-xs flex flex-col items-center gap-2">
               <Sparkles className="w-6 h-6 text-[#6BCBCA] animate-spin" />
-              <span className="font-semibold">Iniciando conversación con el tutor...</span>
+              <span className="font-semibold">Estableciendo conexión de voz en tiempo real con Gemini...</span>
             </div>
           )}
 
@@ -417,7 +419,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                 className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
               >
                 <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1 px-1">
-                  {isUser ? 'Tú (Estudiante)' : 'Tutor IA'}
+                  {isUser ? 'Tú (Estudiante)' : 'Tutor Gemini Live'}
                 </span>
                 <div
                   className={`p-4 rounded-2xl max-w-[85%] text-xs sm:text-sm leading-relaxed ${
@@ -436,7 +438,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
             <div className="flex flex-col items-end opacity-80">
               <span className="text-[10px] font-bold text-[#6BCBCA] uppercase tracking-wider mb-1 px-1 flex items-center gap-1">
                 <span className="w-2 h-2 bg-[#6BCBCA] rounded-full animate-ping" />
-                Escuchando...
+                Procesando voz...
               </span>
               <div className="p-4 rounded-2xl max-w-[85%] text-xs sm:text-sm leading-relaxed bg-[#6BCBCA]/20 text-teal-900 border border-[#6BCBCA]/40 italic rounded-br-none">
                 {currentUserDraft}...
@@ -444,10 +446,15 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
             </div>
           )}
 
-          {isLoadingReply && messages.length > 0 && (
-            <div className="flex items-center gap-2 text-xs text-[#6BCBCA] font-bold py-2">
-              <span className="w-2 h-2 bg-[#6BCBCA] rounded-full animate-ping" />
-              <span>Pensando respuesta...</span>
+          {currentAssistantText && (
+            <div className="flex flex-col items-start">
+              <span className="text-[10px] font-bold text-[#FF6B6B] uppercase tracking-wider mb-1 flex items-center gap-1">
+                <span className="w-2 h-2 bg-[#FF6B6B] rounded-full animate-ping" />
+                <span>Tutor IA hablando...</span>
+              </span>
+              <div className="p-4 rounded-2xl max-w-[85%] text-xs sm:text-sm leading-relaxed bg-blue-50 border border-blue-200 text-gray-900 font-medium shadow-xs">
+                {currentAssistantText}
+              </div>
             </div>
           )}
         </div>
@@ -456,7 +463,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
         <div className="pt-2 border-t border-gray-100 flex flex-wrap items-center justify-center gap-2 sm:gap-3">
           <button
             onClick={handleSlower}
-            disabled={isLoadingReply}
+            disabled={!isConnected}
             className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 rounded-2xl font-bold text-xs text-gray-700 transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
           >
             <Gauge className="w-4 h-4 text-amber-600" />
@@ -465,7 +472,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
 
           <button
             onClick={handleRepeat}
-            disabled={isLoadingReply}
+            disabled={!isConnected}
             className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 rounded-2xl font-bold text-xs text-gray-700 transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
           >
             <RotateCcw className="w-4 h-4 text-[#FF6B6B]" />
@@ -475,7 +482,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
           {['A1', 'A2', 'B1'].includes(level) && (
             <button
               onClick={handleSpanishHelp}
-              disabled={isLoadingReply}
+              disabled={!isConnected}
               className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 rounded-2xl font-bold text-xs text-gray-700 transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
               <Languages className="w-4 h-4 text-teal-600" />
@@ -502,12 +509,12 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
               onKeyDown={(e) => {
                 if (e.key === 'Enter') handleUserSendMessage(textInput);
               }}
-              placeholder="Escribe un mensaje si no quieres usar micrófono..."
+              placeholder="Enviar texto a la sesión Gemini Live..."
               className="flex-1 px-4 py-2.5 border-2 border-gray-200 rounded-xl text-xs focus:outline-none focus:border-[#FF6B6B]"
             />
             <button
               onClick={() => handleUserSendMessage(textInput)}
-              disabled={!textInput.trim() || isLoadingReply}
+              disabled={!textInput.trim() || !isConnected}
               className="px-4 py-2.5 bg-[#FF6B6B] hover:bg-red-500 text-white text-xs font-bold rounded-xl transition-colors flex items-center gap-1 cursor-pointer disabled:opacity-50"
             >
               <Send className="w-4 h-4" />
