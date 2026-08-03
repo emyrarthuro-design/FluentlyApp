@@ -159,12 +159,29 @@ export class SpeechEngine {
     // Interrupt any active speech first
     this.stopSpeaking();
 
+    // Ensure speechSynthesis is active (Chrome workaround for paused state)
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+    }
+
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'en-US';
     utterance.rate = rate ?? this.speechRate;
     utterance.pitch = 1.0;
 
-    if (this.preferredVoice) {
+    // Dynamically select preferred voice if available
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {
+      const enVoices = voices.filter((v) => v.lang.startsWith('en'));
+      const voiceToUse =
+        enVoices.find((v) => v.name.includes('Google') || v.name.includes('Natural')) ||
+        enVoices.find((v) => v.default) ||
+        enVoices[0] ||
+        voices[0];
+      if (voiceToUse) {
+        utterance.voice = voiceToUse;
+      }
+    } else if (this.preferredVoice) {
       utterance.voice = this.preferredVoice;
     }
 
@@ -183,8 +200,12 @@ export class SpeechEngine {
       }
     };
 
-    utterance.onerror = (event) => {
-      console.error('Speech synthesis error:', event);
+    utterance.onerror = (event: any) => {
+      // Ignore normal cancellation/interruption/not-allowed browser behaviors
+      const err = event?.error;
+      if (err !== 'canceled' && err !== 'interrupted' && err !== 'not-allowed') {
+        console.warn('Speech synthesis note:', err || event);
+      }
       this.isSpeaking = false;
       this.currentUtterance = null;
       if (this.options.onAssistantEndSpeaking) {
@@ -193,7 +214,16 @@ export class SpeechEngine {
     };
 
     this.currentUtterance = utterance;
-    window.speechSynthesis.speak(utterance);
+    try {
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      console.warn('Could not trigger speech synthesis:', err);
+      this.isSpeaking = false;
+      this.currentUtterance = null;
+      if (this.options.onAssistantEndSpeaking) {
+        this.options.onAssistantEndSpeaking();
+      }
+    }
   }
 
   public stopSpeaking() {
