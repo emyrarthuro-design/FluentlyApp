@@ -276,6 +276,8 @@ export class LiveVoiceEngine {
         }
       } else if (msg.type === 'interrupted') {
         this.stopSpeaking();
+      } else if (msg.type === 'error') {
+        this.options.onError(msg.text || msg.message || 'Error desconocido de Gemini Live');
       } else if (msg.type === 'turn_complete') {
         if (this.currentAssistantChunkText) {
           this.options.onAssistantTranscript(this.currentAssistantChunkText, true);
