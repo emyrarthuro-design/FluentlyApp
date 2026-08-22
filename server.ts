@@ -4,12 +4,6 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type, Modality, LiveServerMessage } from '@google/genai';
 import { WebSocketServer, WebSocket } from 'ws';
 import dotenv from 'dotenv';
-import {
-  generateSmartTutorReply,
-  generateSmartSessionSummary,
-  generateTutorGreeting,
-} from './src/utils/tutorLogic';
-import { EnglishLevel } from './src/types';
 
 dotenv.config();
 
@@ -95,35 +89,24 @@ If the conversation is just starting, welcome the user warmly, acknowledge their
         });
       }
 
-      let replyText: string;
-      try {
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: formattedContents,
-          config: {
-            systemInstruction,
-            temperature: 0.7,
-          },
-        });
-        replyText = response.text || generateSmartTutorReply({ level: level as EnglishLevel, messages, action });
-      } catch (genErr: any) {
-        if (genErr?.message?.includes('RESOURCE_EXHAUSTED') || genErr?.status === 429) {
-          console.log('Gemini API quota depleted; using intelligent tutor fallback for chat.');
-        } else {
-          console.warn('Gemini generateContent error in /api/chat, using smart tutor fallback:', genErr?.message || genErr);
-        }
-        replyText = generateSmartTutorReply({ level: level as EnglishLevel, messages, action });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: formattedContents,
+        config: {
+          systemInstruction,
+          temperature: 0.7,
+        },
+      });
+
+      const replyText = response.text;
+      if (!replyText) {
+        throw new Error('Empty response received from Gemini model');
       }
 
       res.json({ reply: replyText });
     } catch (error: any) {
       console.error('Error in /api/chat:', error);
-      const fallbackReply = generateSmartTutorReply({
-        level: (req.body?.level || 'B1') as EnglishLevel,
-        messages: req.body?.messages || [],
-        action: req.body?.action,
-      });
-      res.json({ reply: fallbackReply });
+      res.status(500).json({ error: error.message || 'Failed to generate tutor reply' });
     }
   });
 
@@ -157,63 +140,50 @@ OUTPUT FORMAT: Return STRICT JSON matching the schema with:
         .map((m: { role: string; text: string }) => `${m.role.toUpperCase()}: ${m.text}`)
         .join('\n');
 
-      let summaryData = null;
-      try {
-        const ai = getAiClient();
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: `Here is the conversation transcript for student at level ${level}:\n\n${transcriptText}\n\nPlease generate the 3-point summary.` }],
-            },
-          ],
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                strengths: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: '1 or 2 positive highlights',
-                },
-                improvements: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: '1 constructive point to improve',
-                },
-                recommendation: {
-                  type: Type.STRING,
-                  description: '1 concrete actionable tip for next practice',
-                },
-              },
-              required: ['strengths', 'improvements', 'recommendation'],
-            },
+      const ai = getAiClient();
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: `Here is the conversation transcript for student at level ${level}:\n\n${transcriptText}\n\nPlease generate the 3-point summary.` }],
           },
-        });
+        ],
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              strengths: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: '1 or 2 positive highlights',
+              },
+              improvements: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: '1 constructive point to improve',
+              },
+              recommendation: {
+                type: Type.STRING,
+                description: '1 concrete actionable tip for next practice',
+              },
+            },
+            required: ['strengths', 'improvements', 'recommendation'],
+          },
+        },
+      });
 
-        if (response && response.text) {
-          summaryData = JSON.parse(response.text);
-        }
-      } catch (genError: any) {
-        if (genError?.message?.includes('RESOURCE_EXHAUSTED') || genError?.status === 429) {
-          console.log('Gemini API quota depleted; using intelligent tutor fallback for summary.');
-        } else {
-          console.warn('Gemini generateContent error in /api/summary, using smart tutor fallback:', genError?.message || genError);
-        }
+      if (!response || !response.text) {
+        throw new Error('Empty summary response received from Gemini model');
       }
 
-      if (!summaryData) {
-        summaryData = generateSmartSessionSummary(messages || [], level as EnglishLevel);
-      }
-
+      const summaryData = JSON.parse(response.text);
       res.json(summaryData);
     } catch (error: any) {
       console.error('Error in /api/summary:', error);
-      const fallbackSummary = generateSmartSessionSummary(req.body?.messages || [], (req.body?.level || 'B1') as EnglishLevel);
-      res.json(fallbackSummary);
+      res.status(500).json({ error: error.message || 'Failed to generate session summary' });
     }
   });
 
@@ -242,52 +212,13 @@ OUTPUT FORMAT: Return STRICT JSON matching the schema with:
   wss.on('connection', async (clientWs, req) => {
     const reqUrl = req.url || '';
     const queryIndex = reqUrl.indexOf('?');
-    let level: EnglishLevel = 'B1';
+    let level = 'B1';
     if (queryIndex !== -1) {
       const searchParams = new URLSearchParams(reqUrl.substring(queryIndex));
-      level = (searchParams.get('level') || 'B1') as EnglishLevel;
+      level = searchParams.get('level') || 'B1';
     }
 
-    const conversationHistory: Array<{ role: 'user' | 'assistant'; text: string }> = [];
-    let isGeminiLiveActive = false;
     let geminiLiveSession: any = null;
-
-    // Send immediate initial greeting so the user is greeted instantly upon entering
-    const initialGreeting = generateTutorGreeting(level);
-    conversationHistory.push({ role: 'assistant', text: initialGreeting });
-
-    // Brief delay to let client setup listeners, then deliver greeting
-    setTimeout(() => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          JSON.stringify({
-            type: 'output_transcript',
-            text: initialGreeting,
-          })
-        );
-        clientWs.send(JSON.stringify({ type: 'turn_complete' }));
-      }
-    }, 400);
-
-    const handleFallbackReply = (userText: string, action?: any) => {
-      conversationHistory.push({ role: 'user', text: userText });
-      const reply = generateSmartTutorReply({
-        level,
-        messages: conversationHistory,
-        action,
-      });
-      conversationHistory.push({ role: 'assistant', text: reply });
-
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          JSON.stringify({
-            type: 'output_transcript',
-            text: reply,
-          })
-        );
-        clientWs.send(JSON.stringify({ type: 'turn_complete' }));
-      }
-    };
 
     try {
       const ai = getAiClient();
@@ -343,29 +274,37 @@ OUTPUT FORMAT: Return STRICT JSON matching the schema with:
             }
           },
           onclose: (c) => {
-            console.log('Gemini Live session closed, operating in intelligent tutor fallback:', c?.reason || '');
-            isGeminiLiveActive = false;
-            geminiLiveSession = null;
+            console.log('Gemini Live session closed:', c?.reason || '');
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ type: 'error', message: `Gemini Live session closed: ${c?.reason || 'disconnected'}` }));
+            }
           },
           onerror: (err) => {
-            console.warn('Gemini Live session warning, switching to fallback:', err);
-            isGeminiLiveActive = false;
-            geminiLiveSession = null;
+            console.error('Gemini Live session error:', err);
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ type: 'error', message: err.message || 'Error en la sesión de voz Gemini Live' }));
+            }
           },
         },
       });
 
-      isGeminiLiveActive = true;
       geminiLiveSession = session;
     } catch (err: any) {
-      console.warn('Gemini Live direct connection unavailable (using conversational tutor engine):', err?.message || err);
-      isGeminiLiveActive = false;
+      console.error('Error connecting to Gemini Live API:', err);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          JSON.stringify({
+            type: 'error',
+            message: err.message || 'Error al conectar con la API de voz en tiempo real de Gemini.',
+          })
+        );
+      }
     }
 
     clientWs.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        if (isGeminiLiveActive && geminiLiveSession) {
+        if (geminiLiveSession) {
           if (msg.type === 'audio' && msg.data) {
             geminiLiveSession.sendRealtimeInput({
               audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
@@ -374,13 +313,6 @@ OUTPUT FORMAT: Return STRICT JSON matching the schema with:
             geminiLiveSession.sendRealtimeInput({
               text: msg.text,
             });
-          }
-        } else {
-          // Intelligent conversational fallback handler
-          if (msg.type === 'text' && msg.text) {
-            handleFallbackReply(msg.text);
-          } else if (msg.type === 'action' && msg.action) {
-            handleFallbackReply('', msg.action);
           }
         }
       } catch (err) {
@@ -401,4 +333,3 @@ OUTPUT FORMAT: Return STRICT JSON matching the schema with:
 }
 
 startServer();
-

@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { EnglishLevel, ChatMessage } from '../types';
 import { LiveVoiceEngine } from '../utils/liveVoiceEngine';
-import { speakText, stopSpeaking, BrowserSpeechRecognizer } from '../utils/speechHelper';
 import {
   Mic,
   MicOff,
@@ -84,34 +83,16 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
     }
   }, [messages, currentAssistantText, currentUserDraft]);
 
-  // Initialize Gemini Live Voice Engine & Browser Speech Recognition
+  // Initialize Gemini Live Voice Engine
   useEffect(() => {
     let canceled = false;
-    let speechRecognizer: BrowserSpeechRecognizer | null = null;
-
-    const playAssistantVoice = (text: string) => {
-      if (canceled || !text.trim()) return;
-      setIsAssistantSpeaking(true);
-      speakText({
-        text: text.trim(),
-        rate: speechRate,
-        onStart: () => {
-          if (!canceled) setIsAssistantSpeaking(true);
-        },
-        onEnd: () => {
-          if (!canceled) setIsAssistantSpeaking(false);
-        },
-        onError: () => {
-          if (!canceled) setIsAssistantSpeaking(false);
-        },
-      });
-    };
 
     const engine = new LiveVoiceEngine({
       level,
       onConnected: () => {
         if (!canceled) {
           setIsConnected(true);
+          setErrorMessage(null);
         }
       },
       onAudioLevel: (vol) => {
@@ -153,8 +134,6 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
               timestamp: Date.now(),
             };
             setMessages((prev) => [...prev, assistantMsg]);
-            // Speak reply if not already spoken via PCM
-            playAssistantVoice(text.trim());
           }
           setCurrentAssistantText('');
         } else {
@@ -173,7 +152,8 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
       },
       onError: (err) => {
         if (!canceled) {
-          console.warn('Voice engine notification:', err);
+          console.error('Voice engine error:', err);
+          setErrorMessage(err);
         }
       },
     });
@@ -187,54 +167,25 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
         if (!canceled) {
           await engine.unlockAudio();
           await engine.startMicrophone();
-
-          // Initialize Web Speech Recognition
-          speechRecognizer = new BrowserSpeechRecognizer(
-            (transcriptText, isFinal) => {
-              if (canceled) return;
-              if (isFinal) {
-                if (transcriptText.trim()) {
-                  const userMsg: ChatMessage = {
-                    id: 'user-' + Date.now(),
-                    role: 'user',
-                    text: transcriptText.trim(),
-                    timestamp: Date.now(),
-                  };
-                  setMessages((prev) => [...prev, userMsg]);
-                  engine.sendTextMessage(transcriptText.trim());
-                }
-                setCurrentUserDraft('');
-              } else {
-                setCurrentUserDraft(transcriptText);
-              }
-            },
-            (recError) => {
-              console.warn('Browser speech recognition notice:', recError);
-            }
-          );
-          speechRecognizer.start();
         } else {
           engine.destroy();
         }
       })
       .catch((err) => {
         if (!canceled) {
-          console.warn('WebSocket direct audio note:', err);
+          console.error('Failed to establish Gemini Live voice connection:', err);
+          setErrorMessage(err?.message || 'Error al conectar con la API de voz en tiempo real de Gemini.');
         }
       });
 
     return () => {
       canceled = true;
-      stopSpeaking();
-      if (speechRecognizer) {
-        speechRecognizer.destroy();
-      }
       engine.destroy();
       if (liveEngineRef.current === engine) {
         liveEngineRef.current = null;
       }
     };
-  }, [level, speechRate]);
+  }, [level]);
 
   // Silence timer monitor
   useEffect(() => {
