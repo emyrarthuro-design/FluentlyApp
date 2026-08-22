@@ -13,19 +13,12 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Lazy getter for Google GenAI client
+  // Lazy getter for Google GenAI client (Vertex AI)
   const getAiClient = () => {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY is not configured in environment variables.');
-    }
     return new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
+      vertexai: true,
+      project: 'fluently-mvp',
+      location: 'us-central1',
     });
   };
 
