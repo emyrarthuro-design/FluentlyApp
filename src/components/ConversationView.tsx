@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { EnglishLevel, ChatMessage } from '../types';
 import { LiveVoiceEngine } from '../utils/liveVoiceEngine';
+import { speakText, stopSpeaking, BrowserSpeechRecognizer } from '../utils/speechHelper';
 import {
   Mic,
   MicOff,
@@ -36,10 +37,28 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [silenceCounter, setSilenceCounter] = useState<number>(0);
+  const [audioVolume, setAudioVolume] = useState<number>(0);
 
   const liveEngineRef = useRef<LiveVoiceEngine | null>(null);
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
-  const isMountedRef = useRef<boolean>(true);
+
+  // Speed rate multiplier based on level
+  const speechRate = React.useMemo(() => {
+    switch (level) {
+      case 'A1':
+        return 0.82;
+      case 'A2':
+        return 0.86;
+      case 'B1':
+        return 0.92;
+      case 'B2':
+        return 0.98;
+      case 'C1':
+      case 'C2':
+      default:
+        return 1.0;
+    }
+  }, [level]);
 
   // Speed rate label for display based on level
   const speedLabel = React.useMemo(() => {
@@ -65,19 +84,48 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
     }
   }, [messages, currentAssistantText, currentUserDraft]);
 
-  // Initialize Gemini Live Voice Engine on mount
+  // Initialize Gemini Live Voice Engine & Browser Speech Recognition
   useEffect(() => {
-    isMountedRef.current = true;
+    let canceled = false;
+    let speechRecognizer: BrowserSpeechRecognizer | null = null;
+
+    const playAssistantVoice = (text: string) => {
+      if (canceled || !text.trim()) return;
+      setIsAssistantSpeaking(true);
+      speakText({
+        text: text.trim(),
+        rate: speechRate,
+        onStart: () => {
+          if (!canceled) setIsAssistantSpeaking(true);
+        },
+        onEnd: () => {
+          if (!canceled) setIsAssistantSpeaking(false);
+        },
+        onError: () => {
+          if (!canceled) setIsAssistantSpeaking(false);
+        },
+      });
+    };
 
     const engine = new LiveVoiceEngine({
       level,
       onConnected: () => {
-        if (isMountedRef.current) {
+        if (!canceled) {
           setIsConnected(true);
         }
       },
+      onAudioLevel: (vol) => {
+        if (!canceled) {
+          setAudioVolume(vol);
+        }
+      },
+      onMicStateChange: (active) => {
+        if (!canceled) {
+          setIsListening(active);
+        }
+      },
       onUserTranscript: (text, isFinal) => {
-        if (!isMountedRef.current) return;
+        if (canceled) return;
         setSilenceCounter(0);
         if (isFinal) {
           if (text.trim()) {
@@ -95,7 +143,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
         }
       },
       onAssistantTranscript: (text, isFinal) => {
-        if (!isMountedRef.current) return;
+        if (canceled) return;
         if (isFinal) {
           if (text.trim()) {
             const assistantMsg: ChatMessage = {
@@ -105,6 +153,8 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
               timestamp: Date.now(),
             };
             setMessages((prev) => [...prev, assistantMsg]);
+            // Speak reply if not already spoken via PCM
+            playAssistantVoice(text.trim());
           }
           setCurrentAssistantText('');
         } else {
@@ -112,44 +162,79 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
         }
       },
       onAssistantStartSpeaking: () => {
-        if (isMountedRef.current) {
+        if (!canceled) {
           setIsAssistantSpeaking(true);
         }
       },
       onAssistantEndSpeaking: () => {
-        if (isMountedRef.current) {
+        if (!canceled) {
           setIsAssistantSpeaking(false);
         }
       },
       onError: (err) => {
-        if (isMountedRef.current) {
-          setErrorMessage(err);
+        if (!canceled) {
+          console.warn('Voice engine notification:', err);
         }
       },
     });
 
     liveEngineRef.current = engine;
 
-    // Connect to Gemini Live WebSocket and activate mic
+    // Connect to Live WebSocket
     engine
       .connect()
-      .then(() => {
-        if (isMountedRef.current) {
-          engine.startMicrophone();
-          setIsListening(true);
+      .then(async () => {
+        if (!canceled) {
+          await engine.unlockAudio();
+          await engine.startMicrophone();
+
+          // Initialize Web Speech Recognition
+          speechRecognizer = new BrowserSpeechRecognizer(
+            (transcriptText, isFinal) => {
+              if (canceled) return;
+              if (isFinal) {
+                if (transcriptText.trim()) {
+                  const userMsg: ChatMessage = {
+                    id: 'user-' + Date.now(),
+                    role: 'user',
+                    text: transcriptText.trim(),
+                    timestamp: Date.now(),
+                  };
+                  setMessages((prev) => [...prev, userMsg]);
+                  engine.sendTextMessage(transcriptText.trim());
+                }
+                setCurrentUserDraft('');
+              } else {
+                setCurrentUserDraft(transcriptText);
+              }
+            },
+            (recError) => {
+              console.warn('Browser speech recognition notice:', recError);
+            }
+          );
+          speechRecognizer.start();
+        } else {
+          engine.destroy();
         }
       })
       .catch((err) => {
-        console.error('Failed to establish Gemini Live voice connection:', err);
+        if (!canceled) {
+          console.warn('WebSocket direct audio note:', err);
+        }
       });
 
     return () => {
-      isMountedRef.current = false;
-      if (liveEngineRef.current) {
-        liveEngineRef.current.destroy();
+      canceled = true;
+      stopSpeaking();
+      if (speechRecognizer) {
+        speechRecognizer.destroy();
+      }
+      engine.destroy();
+      if (liveEngineRef.current === engine) {
+        liveEngineRef.current = null;
       }
     };
-  }, [level]);
+  }, [level, speechRate]);
 
   // Silence timer monitor
   useEffect(() => {
@@ -215,11 +300,19 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   };
 
   // Toggle Microphone
-  const toggleListening = () => {
+  const toggleListening = async () => {
     if (!liveEngineRef.current) return;
+    setErrorMessage(null);
+    await liveEngineRef.current.unlockAudio();
     const newListening = !isListening;
-    setIsListening(newListening);
     liveEngineRef.current.toggleMicrophone(newListening);
+  };
+
+  const handleActivateMicrophone = async () => {
+    if (!liveEngineRef.current) return;
+    setErrorMessage(null);
+    await liveEngineRef.current.unlockAudio();
+    await liveEngineRef.current.startMicrophone();
   };
 
   return (
@@ -261,7 +354,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
       </div>
 
       {/* Main Voice Interactive Status Card */}
-      <div className="bg-white border-4 border-[#FF6B6B] rounded-[32px] p-8 shadow-xl text-center space-y-6 relative overflow-hidden">
+      <div className="bg-white border-4 border-[#FF6B6B] rounded-[32px] p-6 sm:p-8 shadow-xl text-center space-y-6 relative overflow-hidden">
         <div className="relative z-10 flex flex-col items-center">
           {/* Main Visual Pulse Circle */}
           <div className="relative mb-4">
@@ -270,14 +363,16 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                 isAssistantSpeaking
                   ? 'bg-[#FF6B6B] text-white shadow-lg shadow-[#FF6B6B]/40 scale-105'
                   : isListening
-                  ? 'bg-[#6BCBCA] text-white shadow-lg shadow-[#6BCBCA]/40'
+                  ? audioVolume > 8
+                    ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-500/40 scale-105'
+                    : 'bg-[#6BCBCA] text-white shadow-lg shadow-[#6BCBCA]/40'
                   : 'bg-gray-100 text-gray-400'
               }`}
             >
               {isAssistantSpeaking ? (
                 <Volume2 className="w-14 h-14 sm:w-16 sm:h-16 animate-bounce" />
               ) : isListening ? (
-                <Mic className="w-14 h-14 sm:w-16 sm:h-16 animate-pulse" />
+                <Mic className={`w-14 h-14 sm:w-16 sm:h-16 ${audioVolume > 8 ? 'scale-110 text-white' : 'animate-pulse'}`} />
               ) : (
                 <MicOff className="w-14 h-14 sm:w-16 sm:h-16" />
               )}
@@ -287,29 +382,77 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
             {(isAssistantSpeaking || isListening) && (
               <div
                 className={`absolute inset-0 rounded-full border-4 animate-ping opacity-30 ${
-                  isAssistantSpeaking ? 'border-[#FF6B6B]' : 'border-[#6BCBCA]'
+                  isAssistantSpeaking
+                    ? 'border-[#FF6B6B]'
+                    : audioVolume > 8
+                    ? 'border-emerald-400'
+                    : 'border-[#6BCBCA]'
                 }`}
               />
             )}
           </div>
 
           <h2 className="text-xl sm:text-2xl font-extrabold text-gray-800">Tutor de Inglés Gemini Live</h2>
-          <p className="text-xs sm:text-sm text-[#FF6B6B] font-bold mt-0.5">
-            {isAssistantSpeaking
-              ? 'Hablando voz nativa IA...'
-              : isListening
-              ? 'Escuchando tu voz...'
-              : !isConnected
-              ? 'Conectando sesión de voz Gemini Live...'
-              : 'Pausado'}
-          </p>
+
+          {/* Real-time Status Label */}
+          <div className="mt-1 flex flex-col items-center gap-2">
+            <p className="text-xs sm:text-sm font-bold">
+              {isAssistantSpeaking ? (
+                <span className="text-[#FF6B6B]">Hablando voz nativa IA...</span>
+              ) : isListening ? (
+                audioVolume > 8 ? (
+                  <span className="text-emerald-600 font-extrabold flex items-center gap-1.5 animate-pulse">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
+                    ¡Capturando tu voz ({audioVolume}%)!
+                  </span>
+                ) : (
+                  <span className="text-teal-700 font-bold">
+                    Escuchando tu voz... (Habla cuando gustes)
+                  </span>
+                )
+              ) : !isConnected ? (
+                <span className="text-gray-500">Conectando sesión de voz Gemini Live...</span>
+              ) : (
+                <span className="text-amber-700">Micrófono pausado en tu celular</span>
+              )}
+            </p>
+
+            {/* Real-time Voice Volume Equalizer Bars */}
+            {isListening && (
+              <div className="flex items-center gap-1 h-6 px-3 py-1 bg-gray-50 rounded-full border border-gray-200">
+                <span className="text-[10px] font-bold text-gray-500 mr-1">Micrófono:</span>
+                {[0.2, 0.4, 0.7, 0.5, 0.3].map((factor, idx) => {
+                  const barHeight = Math.max(4, Math.min(20, Math.round((audioVolume * factor * 20) / 30) + 4));
+                  return (
+                    <div
+                      key={idx}
+                      className={`w-1.5 rounded-full transition-all duration-75 ${
+                        audioVolume > 8 ? 'bg-emerald-500' : 'bg-gray-300'
+                      }`}
+                      style={{ height: `${barHeight}px` }}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
           {/* Controls: Mute/Interrupt and Mic toggle */}
-          <div className="flex items-center gap-4 mt-6">
+          <div className="flex flex-wrap items-center justify-center gap-3 sm:gap-4 mt-5">
+            {isConnected && !isListening && (
+              <button
+                onClick={handleActivateMicrophone}
+                className="px-6 py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl font-black transition-all flex items-center gap-2 text-sm cursor-pointer shadow-lg shadow-emerald-600/30 animate-bounce"
+              >
+                <Mic className="w-5 h-5" />
+                <span>Toca para activar micrófono</span>
+              </button>
+            )}
+
             <button
               onClick={toggleListening}
               disabled={!isConnected}
-              className={`p-4 rounded-2xl font-bold transition-all flex items-center gap-2 text-sm cursor-pointer shadow-sm disabled:opacity-50 ${
+              className={`px-5 py-3.5 rounded-2xl font-bold transition-all flex items-center gap-2 text-sm cursor-pointer shadow-sm disabled:opacity-50 ${
                 isListening
                   ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'
                   : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
@@ -331,7 +474,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
             {isAssistantSpeaking && (
               <button
                 onClick={handleInterrupt}
-                className="p-4 bg-red-100 hover:bg-red-200 text-red-700 rounded-2xl font-bold transition-all flex items-center gap-2 text-sm cursor-pointer animate-pulse"
+                className="px-5 py-3.5 bg-red-100 hover:bg-red-200 text-red-700 rounded-2xl font-bold transition-all flex items-center gap-2 text-sm cursor-pointer animate-pulse"
               >
                 <VolumeX className="w-5 h-5" />
                 <span>Interrumpir</span>
@@ -343,34 +486,28 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
 
       {/* Error alert if any */}
       {errorMessage && (
-        <div className="p-4 bg-red-50 border-2 border-red-200 rounded-2xl text-xs text-red-700 flex items-center justify-between gap-3 shadow-xs">
-          <div className="flex items-center gap-2">
-            <AlertCircle className="w-5 h-5 shrink-0 text-red-600" />
-            <span>{errorMessage}</span>
+        <div className="p-4 bg-red-50 border-2 border-red-200 rounded-2xl text-xs text-red-700 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-start sm:items-center gap-2">
+            <AlertCircle className="w-5 h-5 shrink-0 text-red-600 mt-0.5 sm:mt-0" />
+            <div>
+              <span className="font-bold block">{errorMessage}</span>
+              <span className="text-[11px] text-red-600">
+                Si estás en el celular, verifica los permisos del navegador (Chrome/Safari) y toca &quot;Activar Micrófono&quot;.
+              </span>
+            </div>
           </div>
           <button
-            onClick={() => {
+            onClick={async () => {
               setErrorMessage(null);
-              setIsConnected(false);
               if (liveEngineRef.current) {
-                liveEngineRef.current
-                  .connect()
-                  .then(() => {
-                    setIsConnected(true);
-                    if (liveEngineRef.current) {
-                      liveEngineRef.current.startMicrophone();
-                      setIsListening(true);
-                    }
-                  })
-                  .catch(() => {
-                    // Handled inside liveEngineRef onError
-                  });
+                await liveEngineRef.current.unlockAudio();
+                await liveEngineRef.current.startMicrophone();
               }
             }}
-            className="px-3 py-1.5 bg-red-100 hover:bg-red-200 text-red-800 font-bold rounded-xl transition-colors shrink-0 cursor-pointer flex items-center gap-1"
+            className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold rounded-xl transition-colors shrink-0 cursor-pointer flex items-center gap-1.5 shadow-sm"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            <span>Reconectar</span>
+            <span>Activar Micrófono</span>
           </button>
         </div>
       )}

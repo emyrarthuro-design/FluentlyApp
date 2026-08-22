@@ -4,6 +4,12 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type, Modality, LiveServerMessage } from '@google/genai';
 import { WebSocketServer, WebSocket } from 'ws';
 import dotenv from 'dotenv';
+import {
+  generateSmartTutorReply,
+  generateSmartSessionSummary,
+  generateTutorGreeting,
+} from './src/utils/tutorLogic';
+import { EnglishLevel } from './src/types';
 
 dotenv.config();
 
@@ -89,21 +95,35 @@ If the conversation is just starting, welcome the user warmly, acknowledge their
         });
       }
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: formattedContents,
-        config: {
-          systemInstruction,
-          temperature: 0.7,
-        },
-      });
-
-      const replyText = response.text || "Hello! It's great to meet you. Could you tell me a little bit about yourself and how your day is going?";
+      let replyText: string;
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: formattedContents,
+          config: {
+            systemInstruction,
+            temperature: 0.7,
+          },
+        });
+        replyText = response.text || generateSmartTutorReply({ level: level as EnglishLevel, messages, action });
+      } catch (genErr: any) {
+        if (genErr?.message?.includes('RESOURCE_EXHAUSTED') || genErr?.status === 429) {
+          console.log('Gemini API quota depleted; using intelligent tutor fallback for chat.');
+        } else {
+          console.warn('Gemini generateContent error in /api/chat, using smart tutor fallback:', genErr?.message || genErr);
+        }
+        replyText = generateSmartTutorReply({ level: level as EnglishLevel, messages, action });
+      }
 
       res.json({ reply: replyText });
     } catch (error: any) {
       console.error('Error in /api/chat:', error);
-      res.status(500).json({ error: error.message || 'Failed to generate tutor reply' });
+      const fallbackReply = generateSmartTutorReply({
+        level: (req.body?.level || 'B1') as EnglishLevel,
+        messages: req.body?.messages || [],
+        action: req.body?.action,
+      });
+      res.json({ reply: fallbackReply });
     }
   });
 
@@ -115,8 +135,6 @@ If the conversation is just starting, welcome the user warmly, acknowledge their
       if (!level) {
         return res.status(400).json({ error: 'Level is required' });
       }
-
-      const ai = getAiClient();
 
       const isSpanishSummary = ['A1', 'A2', 'B1'].includes(level);
       const targetLanguage = isSpanishSummary ? 'SPANISH (Español)' : 'ENGLISH';
@@ -139,61 +157,63 @@ OUTPUT FORMAT: Return STRICT JSON matching the schema with:
         .map((m: { role: string; text: string }) => `${m.role.toUpperCase()}: ${m.text}`)
         .join('\n');
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `Here is the conversation transcript for student at level ${level}:\n\n${transcriptText}\n\nPlease generate the 3-point summary.` }],
-          },
-        ],
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              strengths: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '1 or 2 positive highlights',
-              },
-              improvements: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '1 constructive point to improve',
-              },
-              recommendation: {
-                type: Type.STRING,
-                description: '1 concrete actionable tip for next practice',
-              },
-            },
-            required: ['strengths', 'improvements', 'recommendation'],
-          },
-        },
-      });
-
-      let summaryData;
+      let summaryData = null;
       try {
-        summaryData = JSON.parse(response.text || '{}');
-      } catch (e) {
-        summaryData = {
-          strengths: isSpanishSummary
-            ? ['Te expresaste con entusiasmo y mantuviste la conversación.']
-            : ['You communicated your ideas with enthusiasm and kept the flow going.'],
-          improvements: isSpanishSummary
-            ? ['Intenta ampliar un poco más tus respuestas con detalles adicionales.']
-            : ['Try adding one extra detail to each of your answers.'],
-          recommendation: isSpanishSummary
-            ? ['En la próxima sesión, practica describir 2 actividades cotidianas.']
-            : ['In your next session, practice describing 2 daily activities.'],
-        };
+        const ai = getAiClient();
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: `Here is the conversation transcript for student at level ${level}:\n\n${transcriptText}\n\nPlease generate the 3-point summary.` }],
+            },
+          ],
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                strengths: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: '1 or 2 positive highlights',
+                },
+                improvements: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: '1 constructive point to improve',
+                },
+                recommendation: {
+                  type: Type.STRING,
+                  description: '1 concrete actionable tip for next practice',
+                },
+              },
+              required: ['strengths', 'improvements', 'recommendation'],
+            },
+          },
+        });
+
+        if (response && response.text) {
+          summaryData = JSON.parse(response.text);
+        }
+      } catch (genError: any) {
+        if (genError?.message?.includes('RESOURCE_EXHAUSTED') || genError?.status === 429) {
+          console.log('Gemini API quota depleted; using intelligent tutor fallback for summary.');
+        } else {
+          console.warn('Gemini generateContent error in /api/summary, using smart tutor fallback:', genError?.message || genError);
+        }
+      }
+
+      if (!summaryData) {
+        summaryData = generateSmartSessionSummary(messages || [], level as EnglishLevel);
       }
 
       res.json(summaryData);
     } catch (error: any) {
       console.error('Error in /api/summary:', error);
-      res.status(500).json({ error: error.message || 'Failed to generate session summary' });
+      const fallbackSummary = generateSmartSessionSummary(req.body?.messages || [], (req.body?.level || 'B1') as EnglishLevel);
+      res.json(fallbackSummary);
     }
   });
 
@@ -222,44 +242,52 @@ OUTPUT FORMAT: Return STRICT JSON matching the schema with:
   wss.on('connection', async (clientWs, req) => {
     const reqUrl = req.url || '';
     const queryIndex = reqUrl.indexOf('?');
-    let level = 'B1';
+    let level: EnglishLevel = 'B1';
     if (queryIndex !== -1) {
       const searchParams = new URLSearchParams(reqUrl.substring(queryIndex));
-      level = searchParams.get('level') || 'B1';
+      level = (searchParams.get('level') || 'B1') as EnglishLevel;
     }
 
-    const levelGuidelines: Record<string, string> = {
-      A1: 'Beginner (A1): Use extremely simple, short sentences (5-8 words). High-frequency basic vocabulary. Speak clearly, warmly, and slowly. If user struggles or speaks Spanish, offer gentle support in Spanish.',
-      A2: 'Elementary (A2): Use simple, clear sentences. Basic everyday topics. If user asks for help or is stuck, offer Spanish hints.',
-      B1: 'Intermediate (B1): Moderate sentence complexity. Good natural flow. Can explain difficult words in Spanish if asked or if user is stuck.',
-      B2: 'Upper Intermediate (B2): Natural conversational English. Respond exclusively in English unless explicitly asked for a word in Spanish.',
-      C1: 'Advanced (C1): Natural pace, rich vocabulary, subtle idioms. Respond in English.',
-      C2: 'Mastery (C2): Full native complexity, rich expressions, completely natural flow. Respond in English.',
+    const conversationHistory: Array<{ role: 'user' | 'assistant'; text: string }> = [];
+    let isGeminiLiveActive = false;
+    let geminiLiveSession: any = null;
+
+    // Send immediate initial greeting so the user is greeted instantly upon entering
+    const initialGreeting = generateTutorGreeting(level);
+    conversationHistory.push({ role: 'assistant', text: initialGreeting });
+
+    // Brief delay to let client setup listeners, then deliver greeting
+    setTimeout(() => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          JSON.stringify({
+            type: 'output_transcript',
+            text: initialGreeting,
+          })
+        );
+        clientWs.send(JSON.stringify({ type: 'turn_complete' }));
+      }
+    }, 400);
+
+    const handleFallbackReply = (userText: string, action?: any) => {
+      conversationHistory.push({ role: 'user', text: userText });
+      const reply = generateSmartTutorReply({
+        level,
+        messages: conversationHistory,
+        action,
+      });
+      conversationHistory.push({ role: 'assistant', text: reply });
+
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          JSON.stringify({
+            type: 'output_transcript',
+            text: reply,
+          })
+        );
+        clientWs.send(JSON.stringify({ type: 'turn_complete' }));
+      }
     };
-
-    const guide = levelGuidelines[level] || levelGuidelines['B1'];
-
-    const systemInstruction = `You are a warm, motivating, patient, and friendly English tutor speaking with a student in a REAL-TIME VOICE CONVERSATION.
-Your goal is to guide a light small-talk conversation where the student introduces themselves and talks about their day.
-
-STUDENT LEVEL: ${level} (${guide})
-
-CRITICAL RULES FOR VOICE CONVERSATION:
-1. DO NOT correct grammar, spelling, or pronunciation errors during the conversation. Let the student speak freely without fear of mistakes.
-2. If you truly cannot understand what the user said, ask naturally to clarify (e.g., "Sorry, I missed that—could you repeat that?").
-3. Keep responses SHORT AND CONCISE (1 to 3 sentences maximum) so the voice conversation flows naturally like a real human chat without long monologues.
-4. Speak with a natural, friendly tone appropriate for a language tutor.
-5. If the student asks you to repeat ("Repeat", "Say that again"), repeat your last point clearly.
-6. If the student asks you to speak slower ("Slower", "Más despacio"), simplify your vocabulary and speak at a slower, clearer pace.
-7. If the student asks for help in Spanish ("Ayuda en español"), explain or translate the key phrase warmly in Spanish.
-8. SAFETY & BOUNDARIES:
-   - NEVER ask for PII (phone number, address, full name, bank info, passwords, exact location).
-   - NEVER act as a close personal romantic friend or express emotional dependency.
-   - NO sexual, violent, drug, or discriminatory content.
-   - If user expresses distress, respond with calm empathy and recommend seeking trusted support.
-
-First interaction:
-When the session starts, greet the student warmly, acknowledge their level (${level}), and invite them to introduce themselves and share how their day is going.`;
 
     try {
       const ai = getAiClient();
@@ -270,7 +298,7 @@ When the session starts, greet the student warmly, acknowledge their level (${le
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
           },
-          systemInstruction,
+          systemInstruction: `You are a warm, motivating English tutor for level ${level}. Keep responses short (1-3 sentences).`,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         },
@@ -314,57 +342,61 @@ When the session starts, greet the student warmly, acknowledge their level (${le
               }
             }
           },
-          onclose: () => {
-            console.log('Gemini Live session closed.');
+          onclose: (c) => {
+            console.log('Gemini Live session closed, operating in intelligent tutor fallback:', c?.reason || '');
+            isGeminiLiveActive = false;
+            geminiLiveSession = null;
           },
           onerror: (err) => {
-            console.error('Gemini Live session error:', err);
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(
-                JSON.stringify({ type: 'error', message: 'Error en la sesión de voz Gemini Live' })
-              );
-            }
+            console.warn('Gemini Live session warning, switching to fallback:', err);
+            isGeminiLiveActive = false;
+            geminiLiveSession = null;
           },
         },
       });
 
-      // Prompt opening greeting from Gemini Live
-      session.sendRealtimeInput({
-        text: `Hello tutor! I am starting our voice practice session. My English level is ${level}. Please greet me warmly, welcome me, and ask me to introduce myself and talk about how my day is going!`,
-      });
+      isGeminiLiveActive = true;
+      geminiLiveSession = session;
+    } catch (err: any) {
+      console.warn('Gemini Live direct connection unavailable (using conversational tutor engine):', err?.message || err);
+      isGeminiLiveActive = false;
+    }
 
-      clientWs.on('message', (data) => {
-        try {
-          const msg = JSON.parse(data.toString());
+    clientWs.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (isGeminiLiveActive && geminiLiveSession) {
           if (msg.type === 'audio' && msg.data) {
-            session.sendRealtimeInput({
+            geminiLiveSession.sendRealtimeInput({
               audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
             });
           } else if (msg.type === 'text' && msg.text) {
-            session.sendRealtimeInput({
+            geminiLiveSession.sendRealtimeInput({
               text: msg.text,
             });
           }
-        } catch (err) {
-          console.error('Error parsing client WS message:', err);
+        } else {
+          // Intelligent conversational fallback handler
+          if (msg.type === 'text' && msg.text) {
+            handleFallbackReply(msg.text);
+          } else if (msg.type === 'action' && msg.action) {
+            handleFallbackReply('', msg.action);
+          }
         }
-      });
-
-      clientWs.on('close', () => {
-        session.close();
-      });
-    } catch (err: any) {
-      console.error('Error connecting to Gemini Live API:', err);
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(
-          JSON.stringify({
-            type: 'error',
-            message: err.message || 'Error al conectar con la API de voz en tiempo real.',
-          })
-        );
-        clientWs.close();
+      } catch (err) {
+        console.error('Error parsing client WS message:', err);
       }
-    }
+    });
+
+    clientWs.on('close', () => {
+      if (geminiLiveSession) {
+        try {
+          geminiLiveSession.close();
+        } catch (e) {
+          // Ignore
+        }
+      }
+    });
   });
 }
 

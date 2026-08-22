@@ -35,11 +35,11 @@ export default function App() {
             className="flex items-center gap-3 cursor-pointer hover:opacity-90 transition-opacity"
           >
             <div className="w-10 h-10 bg-[#FF6B6B] rounded-xl flex items-center justify-center text-white font-extrabold text-xl shadow-md shadow-red-500/20">
-              V
+              F
             </div>
             <div>
               <span className="font-extrabold text-lg text-gray-800 tracking-tight block leading-none">
-                VoxTutor AI
+                Fluently App
               </span>
               <span className="text-[11px] text-gray-500 font-semibold">
                 Práctica de Inglés Hablado por Voz

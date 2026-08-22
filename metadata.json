@@ -1,5 +1,5 @@
 {
-  "name": "Practica de Ingles por Voz AI",
+  "name": "Fluently App",
   "description": "Prototipo de conversación en inglés por voz en tiempo real con asistente IA, adaptación por nivel y retroalimentación final.",
   "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

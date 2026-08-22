@@ -6,6 +6,8 @@ export interface LiveVoiceEngineOptions {
   onAssistantEndSpeaking: () => void;
   onError: (error: string) => void;
   onConnected?: () => void;
+  onAudioLevel?: (volumePercent: number) => void;
+  onMicStateChange?: (active: boolean) => void;
 }
 
 export class LiveVoiceEngine {
@@ -13,7 +15,9 @@ export class LiveVoiceEngine {
   private inputAudioCtx: AudioContext | null = null;
   private outputAudioCtx: AudioContext | null = null;
   private mediaStream: MediaStream | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
+  private muteGainNode: GainNode | null = null;
   private isListening: boolean = false;
   private isSpeaking: boolean = false;
   private nextStartTime: number = 0;
@@ -24,6 +28,26 @@ export class LiveVoiceEngine {
 
   constructor(options: LiveVoiceEngineOptions) {
     this.options = options;
+  }
+
+  public async unlockAudio(): Promise<void> {
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!this.inputAudioCtx && AudioContextClass) {
+        this.inputAudioCtx = new AudioContextClass();
+      }
+      if (this.inputAudioCtx && this.inputAudioCtx.state === 'suspended') {
+        await this.inputAudioCtx.resume();
+      }
+      if (!this.outputAudioCtx && AudioContextClass) {
+        this.outputAudioCtx = new AudioContextClass();
+      }
+      if (this.outputAudioCtx && this.outputAudioCtx.state === 'suspended') {
+        await this.outputAudioCtx.resume();
+      }
+    } catch (e) {
+      console.warn('Audio unlock warning:', e);
+    }
   }
 
   public async connect(retries = 3): Promise<void> {
@@ -75,45 +99,71 @@ export class LiveVoiceEngine {
 
   public async startMicrophone(): Promise<void> {
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        this.options.onError(
+          'Tu navegador no soporta captura de micrófono o la página requiere HTTPS. Por favor usa Chrome o Safari en tu celular.'
+        );
+        return;
+      }
+
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) {
+        this.options.onError('Tu navegador no soporta Web Audio API.');
+        return;
+      }
+
       if (!this.inputAudioCtx) {
-        this.inputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        this.inputAudioCtx = new AudioContextClass();
       }
       if (this.inputAudioCtx.state === 'suspended') {
         await this.inputAudioCtx.resume();
       }
 
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch (err) {
+        console.warn('Fallback to basic audio getUserMedia:', err);
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
 
-      const source = this.inputAudioCtx.createMediaStreamSource(this.mediaStream);
+      this.mediaStream = stream;
+      this.sourceNode = this.inputAudioCtx.createMediaStreamSource(stream);
       this.scriptProcessor = this.inputAudioCtx.createScriptProcessor(4096, 1, 1);
 
-      const sampleRate = this.inputAudioCtx.sampleRate;
+      // Create a 0-gain node to route audio without playing it through speakers on mobile
+      this.muteGainNode = this.inputAudioCtx.createGain();
+      this.muteGainNode.gain.value = 0;
 
       this.scriptProcessor.onaudioprocess = (e) => {
-        if (!this.isListening || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (!this.isListening || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          if (this.options.onAudioLevel) {
+            this.options.onAudioLevel(0);
+          }
+          return;
+        }
 
         const inputBuffer = e.inputBuffer.getChannelData(0);
 
-        // Simple volume threshold check for user speech (Barge-in trigger)
+        // Calculate live volume level for UI feedback
         let sum = 0;
         for (let i = 0; i < inputBuffer.length; i++) {
           sum += inputBuffer[i] * inputBuffer[i];
         }
         const rms = Math.sqrt(sum / inputBuffer.length);
+        const volumeLevel = Math.min(100, Math.round(rms * 450));
 
-        // If user speaks loudly while assistant is speaking, trigger local barge-in interrupt
-        if (rms > 0.04 && this.isSpeaking) {
-          this.stopSpeaking();
-          this.sendInterruptSignal();
+        if (this.options.onAudioLevel) {
+          this.options.onAudioLevel(volumeLevel);
         }
 
-        // Resample audio to 16000Hz if needed
+        const sampleRate = this.inputAudioCtx?.sampleRate || 44100;
         const resampled = this.resampleFloat32Array(inputBuffer, sampleRate, 16000);
         const pcmBuffer = this.floatTo16BitPCM(resampled);
         const base64PCM = this.arrayBufferToBase64(pcmBuffer);
@@ -121,24 +171,50 @@ export class LiveVoiceEngine {
         this.ws.send(JSON.stringify({ type: 'audio', data: base64PCM }));
       };
 
-      source.connect(this.scriptProcessor);
-      this.scriptProcessor.connect(this.inputAudioCtx.destination);
+      this.sourceNode.connect(this.scriptProcessor);
+      this.scriptProcessor.connect(this.muteGainNode);
+      this.muteGainNode.connect(this.inputAudioCtx.destination);
+
       this.isListening = true;
+      if (this.options.onMicStateChange) {
+        this.options.onMicStateChange(true);
+      }
     } catch (err: any) {
       console.error('Failed to access microphone:', err);
-      this.options.onError('No se pudo acceder al micrófono. Por favor permite los permisos.');
+      let errorMsg = 'No se pudo acceder al micrófono.';
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        errorMsg = 'Permiso de micrófono denegado. Por favor permite el acceso al micrófono en los ajustes de tu navegador.';
+      } else if (err.name === 'NotFoundError') {
+        errorMsg = 'No se encontró ningún micrófono en tu dispositivo.';
+      }
+      this.options.onError(errorMsg);
     }
   }
 
   public stopMicrophone(): void {
     this.isListening = false;
+    if (this.options.onMicStateChange) {
+      this.options.onMicStateChange(false);
+    }
+    if (this.options.onAudioLevel) {
+      this.options.onAudioLevel(0);
+    }
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((track) => track.stop());
       this.mediaStream = null;
     }
     if (this.scriptProcessor) {
+      this.scriptProcessor.onaudioprocess = null;
       this.scriptProcessor.disconnect();
       this.scriptProcessor = null;
+    }
+    if (this.sourceNode) {
+      this.sourceNode.disconnect();
+      this.sourceNode = null;
+    }
+    if (this.muteGainNode) {
+      this.muteGainNode.disconnect();
+      this.muteGainNode = null;
     }
   }
 
@@ -217,18 +293,21 @@ export class LiveVoiceEngine {
 
   private async playAudioChunk(base64Data: string): Promise<void> {
     try {
-      if (!this.outputAudioCtx) {
-        this.outputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
-          sampleRate: 24000,
-        });
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!this.outputAudioCtx && AudioContextClass) {
+        // Do not pass sampleRate: 24000 to AudioContext constructor on iOS / mobile!
+        this.outputAudioCtx = new AudioContextClass();
       }
-      if (this.outputAudioCtx.state === 'suspended') {
+      if (this.outputAudioCtx && this.outputAudioCtx.state === 'suspended') {
         await this.outputAudioCtx.resume();
       }
+      if (!this.outputAudioCtx) return;
 
       const float32Data = this.base64ToFloat32Array(base64Data);
       if (float32Data.length === 0) return;
 
+      // The raw PCM from Gemini Live native audio is 24000Hz mono.
+      // createBuffer with 24000 tells Web Audio API the source rate, and it will smoothly resample to device rate.
       const buffer = this.outputAudioCtx.createBuffer(1, float32Data.length, 24000);
       buffer.getChannelData(0).set(float32Data);
 
@@ -250,7 +329,11 @@ export class LiveVoiceEngine {
 
       source.onended = () => {
         this.activeSources = this.activeSources.filter((s) => s !== source);
-        if (this.activeSources.length === 0 && this.outputAudioCtx && this.outputAudioCtx.currentTime >= this.nextStartTime) {
+        if (
+          this.activeSources.length === 0 &&
+          this.outputAudioCtx &&
+          this.outputAudioCtx.currentTime >= this.nextStartTime
+        ) {
           if (this.isSpeaking) {
             this.isSpeaking = false;
             this.options.onAssistantEndSpeaking();
@@ -321,15 +404,23 @@ export class LiveVoiceEngine {
     this.stopMicrophone();
     this.stopSpeaking();
     if (this.ws) {
-      this.ws.close();
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null;
+      try {
+        this.ws.close();
+      } catch (e) {
+        // ignore
+      }
       this.ws = null;
     }
     if (this.inputAudioCtx) {
-      this.inputAudioCtx.close();
+      this.inputAudioCtx.close().catch(() => {});
       this.inputAudioCtx = null;
     }
     if (this.outputAudioCtx) {
-      this.outputAudioCtx.close();
+      this.outputAudioCtx.close().catch(() => {});
       this.outputAudioCtx = null;
     }
   }
